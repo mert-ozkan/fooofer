@@ -152,11 +152,13 @@ classdef  SumOfGaussians < ModelBuilder
              dx = mode(diff(x_data));
              y_flat = detrend(y_interp);
              % get Q3 and median (in case median is diff than zero)
-             [~, q] = iqr(y_flat);
+             % [~, q] = iqr(y_flat); % does not work on R2023a
+            
              med = median(y_flat);
-             p_thr = q(2)-med;
-
-             [~, cf, bw, p] = findpeaks(y_interp, x_data, ...
+             q2 = median(y_flat(y_flat > med));
+             p_thr = q2-med;
+            
+             [amp, cf, bw, p] = findpeaks(y_interp, x_data, ...
                  MinPeakDistance = pv.min_peak_distance, ...
                  MinPeakProminence= p_thr,...
                  MinPeakWidth = pv.min_peak_width,...
@@ -165,8 +167,11 @@ classdef  SumOfGaussians < ModelBuilder
              cf_idx = arrayfun(@(f) gen.absargmin(x_data - f), cf);
              bw_bins = bw./dx;
              bw_bins(bw_bins < 2) = 2; % at least 2 bins necessary
-             [amp, cf] = refinepeaks(y_interp, cf_idx, x_data, LobeWidth=bw_bins, Method='NLS');
-             cf_idx = arrayfun(@(f) gen.absargmin(x_data - f), cf);
+             
+             % % Does not work in R2023a
+             % [amp, cf] = refinepeaks(y_interp, cf_idx, x_data, LobeWidth=bw_bins, Method='NLS');
+             % cf_idx = arrayfun(@(f) gen.absargmin(x_data - f), cf);
+             
              % refine peak estimates for gaussian fitting
              % The peaks must be centered in Gaussians but findpeaks does not force this
              % constraint.
