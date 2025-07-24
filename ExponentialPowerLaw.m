@@ -116,12 +116,14 @@ classdef ExponentialPowerLaw < ModelBuilder
 
 
                 kneeN = 0;
-                n_ch_pt = 1;
+                n_ch_pt = 1;                
                 while kneeN < 20
                     % if found an earlier point, it is unlikely to be assc w knee parameter
                     % try again with more ch_pts
                     knee_idx = findchangepts(y_interp, MaxNumChanges=n_ch_pt, Statistic= "linear");
-                    kneeN = 10^log_x_data(max(knee_idx));
+                    if ~isempty(knee_idx)
+                        kneeN = 10^log_x_data(max(knee_idx));
+                    end
                     n_ch_pt  = n_ch_pt + 1;
                 end
 
