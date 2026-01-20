@@ -1,4 +1,4 @@
 [submodule "model_builder"]
 	path = model_builder
 	url = https://github.com/klabhub/model_builder.git
-	branch = submod-dj
+	branch = nllminim

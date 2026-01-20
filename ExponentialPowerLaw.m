@@ -13,25 +13,32 @@ classdef ExponentialPowerLaw < ModelBuilder
 
     end
 
-    properties
+    properties (SetAccess = protected)
         % --- Abstract Properties Implementation from ModelBuilder ---
-        model sym % The main symbolic function, defined in the constructor
+        formula sym % The main symbolic function, defined in the constructor
         x = sym('x'); % Symbolic independent variable
         y = sym('y'); % Symbolic dependent variable
         y_hat = sym('y_hat'); % Symbolic representation of the model's prediction
 
+    end
+
+    properties
+        
         % --- Class-Specific Properties ---
-        inLogScale (1,1) logical = true % Flag to compute on a log scale
+        scale {mustBeText, mustBeMember(scale, {'log', 'linear'})} = 'log'
+        % =inLogScale (1,1) logical = true % Flag to compute on a log scale
         includeKnee (1,1) logical = true       % Flag to include the exponential knee term
 
     end
-
+    
     properties (Dependent)
         % --- Abstract Dependent Property Implementation from ModelBuilder ---
         parameters % Vector of symbolic parameters for this model
 
         lower_bounds
         upper_bounds
+
+        inLogScale
 
     end
 
@@ -48,39 +55,24 @@ classdef ExponentialPowerLaw < ModelBuilder
             % It defines the symbolic model and its configuration.
             arguments
                 pv.includeKnee (1,1) logical = true
-                pv.inLogScale (1,1) logical = true
+                % pv.inLogScale (1,1) logical = true
+                pv.scale = 'log'
                 pv.verbose (1,1) logical = true
             end
             % Assign configuration from name-value pairs
             self.includeKnee = pv.includeKnee;
-            self.inLogScale = pv.inLogScale;
-            self.verbose = pv.verbose;
-
-            % --- Model Definition ---
-            if self.verbose; fprintf('Constructing ExponentialPowerLaw model...\n'); end
-
-            % Define the core power-law model
-            base_model = self.intercept * (self.x^-self.exponent);
-
-            % Optionally add the exponential knee term
-            if self.includeKnee
-
-                self.model = base_model * exp(-self.x / self.knee);
-
-            else
-                self.model = base_model;
-            end
-
-            % Optionally transform the entire model to log scale for fitting
-            if self.inLogScale
-                self.model = log10(self.model);
-            end
+            self.scale = pv.scale;
+            % self.inLogScale = pv.inLogScale; % setting this value triggers set_formula_
+            self.verbose = pv.verbose;           
+            self.set_formula_();
 
             if self.verbose; fprintf('\tDone constructing model.\n'); end
         end
 
         % --- Abstract Method Implementations from ModelBuilder ---
         function P_est = estimate(self, x_data, y_data)
+
+            % assumes y_data is logarithmic
 
             if ~isvector(y_data)
 
@@ -90,13 +82,15 @@ classdef ExponentialPowerLaw < ModelBuilder
             kneeN = [];
             isBeforeKnee = false(size(x_data));
             isBeforeKnee(1:round(numel(x_data)/2)) = true;
+            log_y_data = log10(y_data); % always in log scale to estimate
+
             if self.includeKnee
 
                 % check if the data is regularly-spaced
                 if ~isscalar(unique(diff(x_data)))
 
                     % interpolate the breaks
-                    [y_data, x_data] = self.interpolate_breaks_(y_data, x_data);
+                    [log_y_data, x_data] = self.interpolate_breaks_(log_y_data, x_data);
 
                 end
 
@@ -112,7 +106,7 @@ classdef ExponentialPowerLaw < ModelBuilder
                 % in log-log scale.
 
                 log_x_data = linspace(log10(min(x_data)), log10(max(x_data)), numel(x_data))';
-                y_interp = interp1(log10(x_data), y_data, log_x_data, 'linear');
+                y_interp = interp1(log10(x_data), log_y_data, log_x_data, 'linear');
 
 
                 kneeN = 0;
@@ -131,7 +125,7 @@ classdef ExponentialPowerLaw < ModelBuilder
                 isBeforeKnee = x_data <= kneeN;
             end
 
-            mdl_for_exp = fitlm(log10(x_data(isBeforeKnee)), y_data(isBeforeKnee));
+            mdl_for_exp = fitlm(log10(x_data(isBeforeKnee)), log_y_data(isBeforeKnee));
             exponentN = -mdl_for_exp.Coefficients.Estimate(2);
             interceptN = 10.^ mdl_for_exp.Coefficients.Estimate(1);
 
@@ -163,7 +157,7 @@ classdef ExponentialPowerLaw < ModelBuilder
 
                  % intercept must be larger than median
                  y_data = self.Y_;
-                 if self.inLogScale, y_data = 10.^y_data; end
+                 % if self.inLogScale, y_data = 10.^y_data; end
                  int_lb = median(y_data, 'all');
                  exp_lb = .1;
                  b = [int_lb, exp_lb];
@@ -207,7 +201,7 @@ classdef ExponentialPowerLaw < ModelBuilder
              else              
                                   
                  y_data = self.Y_;
-                 if self.inLogScale, y_data = 10.^y_data; end
+                 % if self.inLogScale, y_data = 10.^y_data; end
                  % intercept cannot be meaningful if too larger from the
                  % maximum amplitude
                  int_lb = max(y_data,[],'all')*1.25;
@@ -239,6 +233,66 @@ classdef ExponentialPowerLaw < ModelBuilder
              self.upper_bounds_ = value;
 
          end
+
+         function i = get.inLogScale(self)
+             i = strcmp(self.scale, 'log');
+         end
+
+         function set.scale(self, value)
+
+             if strcmp(self.scale, value), return; end
+             self.scale = value;
+             % change model formula
+             self.set_formula_();
+         end
+
+         function set.includeKnee(self, value)
+
+             if strcmp(self.includeKnee, value), return; end
+             self.includeKnee = value;
+             % change model formula
+             self.set_formula_();
+
+         end
+
+         % function set.inLogScale(self, value)
+         % 
+         %     arguments
+         % 
+         %        self
+         %        value (1,1) logical
+         % 
+         %    end
+         % 
+         %    self.inLogScale = value;
+         %    % change model formula
+         %    self.set_formula_();
+         % 
+         % end
+
+    end
+
+    methods (Access = protected)
+
+        function set_formula_(self)
+
+            % Define the core power-law model
+            self.formula = self.intercept * (self.x^-self.exponent);
+
+            % Optionally add the exponential knee term
+            if self.includeKnee
+
+                self.formula = self.formula * exp(-self.x / self.knee);
+
+            end
+
+            if self.inLogScale
+
+                self.formula = log10(self.formula);
+            
+            end
+
+        end
 
     end
 

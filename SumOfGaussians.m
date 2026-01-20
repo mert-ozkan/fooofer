@@ -1,5 +1,14 @@
 classdef  SumOfGaussians < ModelBuilder
 
+    properties (SetAccess = protected)
+        % --- Abstract Properties Implementation from ModelBuilder ---
+        formula sym % The main symbolic function, defined in the constructor
+        x = sym('x'); % Symbolic independent variable
+        y = sym('y'); % Symbolic dependent variable
+        y_hat = sym('y_hat'); % Symbolic representation of the model's prediction
+
+    end
+
     properties
 
         baseline (1,1) sym = sym('b')
@@ -10,19 +19,10 @@ classdef  SumOfGaussians < ModelBuilder
 
         min_peak_width = .1
         min_peak_distance = 1
-        min_peak_frequency = []
-        max_peak_frequency = []
+        min_peak_frequency = NaN
+        max_peak_frequency = NaN
 
         includeBaseline = true
-        
-    end
-
-    properties
-        % --- Abstract Properties Implementation from ModelBuilder ---
-        model sym % The main symbolic function, defined in the constructor
-        x = sym('x'); % Symbolic independent variable
-        y = sym('y'); % Symbolic dependent variable
-        y_hat = sym('y_hat'); % Symbolic representation of the model's prediction        
         
     end
 
@@ -53,8 +53,8 @@ classdef  SumOfGaussians < ModelBuilder
                 pv.min_peak_width = []
                 pv.min_peak_distance = []
 
-                pv.min_peak_frequency = []
-                pv.max_peak_frequency = []
+                pv.min_peak_frequency = NaN
+                pv.max_peak_frequency = NaN
                 
                 pv.verbose (1,1) logical = true
                 pv.includeBaseline (1,1) logical = true;
@@ -93,10 +93,15 @@ classdef  SumOfGaussians < ModelBuilder
 
             
             % --- Model Definition ---
-            if self.verbose; fprintf('Constructing Gaussian model...\n'); end
+            if self.verbose; fprintf('Constructing Sum-of-Gaussians model...\n'); end
          end
       
          function set.n_peaks(self, value)
+
+             arguments
+                 self
+                 value {mustBePositive, mustBeInteger}
+             end
 
              % if changes, the model changes
              self.n_peaks = value;
@@ -106,6 +111,8 @@ classdef  SumOfGaussians < ModelBuilder
          
 
          function P_est = estimate(self, x_data, y_data,pv)
+
+             % assumes y_data is normally distributed
 
              arguments
 
@@ -119,6 +126,13 @@ classdef  SumOfGaussians < ModelBuilder
                  pv.min_peak_frequency = self.min_peak_frequency
                  pv.max_peak_frequency = self.max_peak_frequency
 
+                 % estimates must be made on normally distributed data, if 
+                 % y_data is not normal ask to logarithmically scale.
+                 % If minimizer uses gamma distribution (y_data strictly
+                 % positive) fitting will be made on linearly scaled data
+                 % but the user must specify estimate(scale='log')
+                 pv.scale {mustBeMember(pv.scale, {'linear','log'})} = 'linear'
+
              end
 
              % If y_data contains multiple observations, take the mean
@@ -128,21 +142,26 @@ classdef  SumOfGaussians < ModelBuilder
 
              % Constrain peak search to pre-assigned bounds
              xInPeakSearch = true(size(x_data));
-             if ~isempty(pv.min_peak_frequency)
+             if ~isempty(pv.min_peak_frequency) & ~isnan(pv.min_peak_frequency)
                  xInPeakSearch = xInPeakSearch & (x_data >= pv.min_peak_frequency);
              end
 
-             if ~isempty(pv.max_peak_frequency)
+             if ~isempty(pv.max_peak_frequency) & ~isnan(pv.max_peak_frequency)
                  xInPeakSearch = xInPeakSearch & (x_data <= pv.max_peak_frequency);
              end
 
              x_data = x_data(xInPeakSearch);
              y_data = y_data(xInPeakSearch);
+             if strcmp(pv.scale,'log')
+                 y_data = log10(y_data);
+             end
 
              % Linear interp if freqs contain breaks
-             if ~isscalar(unique(diff(x_data)))
+             if ~isscalar(uniquetol(diff(x_data),1e-6))
 
                  [y_interp, x_data] = self.interpolate_breaks_(y_data, x_data);
+             else
+                 y_interp = y_data;
 
              end
                          
@@ -159,10 +178,10 @@ classdef  SumOfGaussians < ModelBuilder
              p_thr = q2-med;
             
              [amp, cf, bw, p] = findpeaks(y_interp, x_data, ...
-                 MinPeakDistance = pv.min_peak_distance, ...
-                 MinPeakProminence= p_thr,...
+                 ... MinPeakDistance = pv.min_peak_distance, ...
+                 ...MinPeakProminence= 1,...
                  MinPeakWidth = pv.min_peak_width,...
-                 NPeaks=self.n_peaks, SortStr='descend');
+                 NPeaks=self.n_peaks, SortStr='descend', Annotate='extents');
 
              cf_idx = arrayfun(@(f) do.argmin(abs(x_data - f)), cf);
              bw_bins = bw./dx;
@@ -181,6 +200,7 @@ classdef  SumOfGaussians < ModelBuilder
 
              ch_pts_idx = findchangepts(y_interp, ...
                  MaxNumChanges = 6*self.n_peaks, ... 6*(onset, peak, offset) x max_n_peaks, higher no makes sure the peaks are detected
+                 MinDistance = round(.5*pv.min_peak_distance/mode(diff(x_data))),...
                  Statistic='linear'... slope changes
                  );
              ch_pts_freqs = x_data(ch_pts_idx);
@@ -257,7 +277,11 @@ classdef  SumOfGaussians < ModelBuilder
              % sorting in descending order of amplitude
              init_params = sortrows(init_params, 1, "descend");
 
-             P_est = [init_params(:); init_b]';
+             P_est = init_params(:)';
+             if self.includeBaseline
+                 P_est = [P_est, init_b];
+             end
+            
 
          end
 
@@ -265,8 +289,9 @@ classdef  SumOfGaussians < ModelBuilder
          function p = get.parameters(self)
 
              p = [self.amplitude, self.center, self.sd];
-             p = [p(:); self.baseline];
-             p = reshape(p, [1, numel(p)]);
+             if self.includeBaseline
+                 p = [p(:); self.baseline]';
+             end
 
          end
 
@@ -285,16 +310,19 @@ classdef  SumOfGaussians < ModelBuilder
                  % better to be lenient in lower bounds
                  amp_lb = max(0, median(self.Y_, 'all'));
 
-                 if isempty(self.min_peak_frequency)
+                 if isempty(self.min_peak_frequency) | isnan(self.min_peak_frequency)
                     cf_lb = min(self.X_) + self.min_peak_width; % must have a reasonable number of data points at least
                  else
                      cf_lb = self.min_peak_frequency;
                  end
                  sd_lb = self.min_peak_width / sqrt(2*log(2)); % transform from fwhm to sd
-                 
-                 b_lb = -.1;
+                                
+                 b = [amp_lb, cf_lb, sd_lb];
+                 if self.includeBaseline
 
-                 b = [amp_lb, cf_lb, sd_lb, b_lb];
+                     b = [b, -.1];
+
+                 end
                  self.lower_bounds = b;
              
              end
@@ -303,14 +331,7 @@ classdef  SumOfGaussians < ModelBuilder
 
          function set.lower_bounds(self, value)
 
-             n_param =numel(value);
-             if ~isempty(value) && self.n_param ~= n_param
-
-                 value = [repelem(value(1:end-1), self.n_peaks), value(end)];
-
-             end
-
-             self.lower_bounds_ = value;
+             self.lower_bounds_ = self.set_bounds_(value);
 
          end
 
@@ -328,7 +349,7 @@ classdef  SumOfGaussians < ModelBuilder
                  
                  amp_ub = max(self.Y_(:))*1.5;
 
-                 if isempty(self.max_peak_frequency)
+                 if isempty(self.max_peak_frequency) | isnan(self.max_peak_frequency)
 
                     cf_ub = max(self.X_) - mode(diff(self.X_))*2;
 
@@ -339,10 +360,15 @@ classdef  SumOfGaussians < ModelBuilder
                  end
                  
                  sd_ub = diff(do.range(self.X_))/3 / (2*sqrt(2*log(2)));
-                 
-                 b_ub = .1;
+                
 
-                 b = [amp_ub, cf_ub, sd_ub, b_ub];
+                 b = [amp_ub, cf_ub, sd_ub];
+                 if self.includeBaseline
+
+                     b = [b, .1];
+
+                 end
+
                  self.upper_bounds = b;
              
              end
@@ -351,59 +377,53 @@ classdef  SumOfGaussians < ModelBuilder
          
          function set.upper_bounds(self, value)
 
-             n_param = numel(value);
-             if ~isempty(value) && self.n_param ~= n_param
-
-                 value = [repelem(value(1:end-1), self.n_peaks), value(end)];
-
-             end
-
-             self.upper_bounds_ = value;
+              self.upper_bounds_ = self.set_bounds_(value);
 
          end
          
          % --- Overwrite Methods ---
-         function y_sim = simulate(self, peak_params, baseline, sigma, varargin)
-
-             if isvector(peak_params)
-                 
-                 peak_params = [peak_params; baseline];
-             
-             else
-                 
-                 peak_params = [peak_params(:); baseline]';
-
-             end
-
-             y_sim = simulate@ModelBuilder(self, peak_params, sigma, varargin{:});             
-
-
-         end
+         % function y_sim = simulate(self, peak_params, baseline, sigma, varargin)
+         % 
+         %     if isvector(peak_params)
+         % 
+         %         peak_params = [peak_params; baseline];
+         % 
+         %     else
+         % 
+         %         peak_params = [peak_params(:); baseline]';
+         % 
+         %     end
+         % 
+         %     y_sim = simulate@ModelBuilder(self, peak_params, sigma, varargin{:});             
+         % 
+         % 
+         % end
 
          function YHat = predict(self, peak_params, varargin)
 
              if nargin > 1
-                 
-                 if isvector(peak_params) 
+                 if self.includeBaseline
+                     if isvector(peak_params) 
+                         
+                         if ~mod(numel(peak_params), 3)
+                         
+                            peak_params = [peak_params(:); varargin{1}]'; %append baseline                        
+                            varargin(1) = [];
+                         
+                         end
                      
-                     if ~mod(numel(peak_params), 3)
-                     
-                        peak_params = [peak_params; varargin{1}]'; %append baseline                        
-                        varargin(1) = [];
-                     
+                     else
+    
+                         peak_params = [peak_params(:); varargin{1}]';
+                         varargin(1) = [];
+    
                      end
-                 
-                 else
-
-                     peak_params = [peak_params(:); varargin{1}]';
-                     varargin(1) = [];
-
                  end
 
                  varargin = [peak_params, varargin];
                  %update the model
                  if numel(peak_params)
-                     self.n_peaks = (numel(peak_params)-1)/3;
+                     self.n_peaks = (numel(peak_params)-self.includeBaseline)/3;
                  end
                  
              end
@@ -459,23 +479,51 @@ classdef  SumOfGaussians < ModelBuilder
          
      end
 
-     methods (Access =protected)
+     methods (Access = protected)
 
          % Makes the model
          function make_(self)
-
+             try
             self.amplitude = sym('a', [self.n_peaks, 1]);
             self.center = sym('mu', [self.n_peaks, 1]);
             self.sd = sym('s', [self.n_peaks, 1]);
-            self.model = sum(self.amplitude .* exp(-(self.x - self.center).^2 ./ (2 * self.sd.^2))) + self.baseline;
+            self.formula = sum(self.amplitude .* exp(-(self.x - self.center).^2 ./ (2 * self.sd.^2)));
+            if self.includeBaseline
+
+                self.formula = self.formula + self.baseline;
+
+            end
+
             self.solve_jacobian();
             self.solve_hessian();
             self.lower_bounds = [];
             self.upper_bounds = [];
+             catch e
+                 aa
+             end
 
          end
-         
 
+         function b = set_bounds_(self, value)
+
+             n_param =numel(value);
+             if ~isempty(value) && self.n_param ~= n_param
+                 
+                 if self.includeBaseline
+
+                     baseline = value(end);
+                     value = value(end-1);
+
+                 else
+                     baseline = [];
+                 end
+                 value = [repelem(value, self.n_peaks), baseline];
+
+             end
+
+             b = value;
+
+        end
 
      end
 

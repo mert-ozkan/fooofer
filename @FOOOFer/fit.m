@@ -4,27 +4,31 @@ arguments
 
     obj FOOOFer
     freqs (:, 1) double
-    spectrum (:, :) double
+    spectrum (:, :) double {mustBePositive}
 
     pv.included_frequencies (:, 2) double = do.range(freqs) %all by default
     pv.excluded_frequencies (:, 2) double = obj.excluded_frequencies
-    pv.apriori_peak_range = []
+    pv.apriori_peak_range (:,2) double = []
     
     pv.plot = false
     pv.rng_seed = randi(2^8)
+    pv.line_styles = ["-", ":"]
+
+    pv.reject_outlier = false
+    pv.outlier_z_threshold = 5
 
 end
-
+try
+% Set the random seed for reproduction
 rng(pv.rng_seed);
 
-line_styles = ["-", ":"];
-% Main fitting method.
+% --- Preparations ---
+% Data constraints
 include_freq_range = pv.included_frequencies;
 exclude_freq_range = pv.excluded_frequencies;
 apriori_peak_range = pv.apriori_peak_range;
 
-% --- Preparations ---
-isFreqIn = freqs~=0;
+isFreqIn = freqs~=0; % 0 Hz is DC component
 
 isFreqExcld = false(size(isFreqIn));
 for ii = 1:size(exclude_freq_range,1)
@@ -39,76 +43,109 @@ if ~isempty(include_freq_range)
 end
 
 analysis_freqs = freqs(isFreqIn & ~isFreqExcld);
-original_spectrum = log10(spectrum(isFreqIn & ~isFreqExcld,:));
-analysis_spectrum = original_spectrum;
-% If there are more than 15 observations, determine outliers and assign
-% weights
-if size(analysis_spectrum,2) > 15 % in the futue, make this optional
+analysis_spectrum = spectrum(isFreqIn & ~isFreqExcld,:);
+% if obj.log_scale
+%     analysis_spectrum = log10(analysis_spectrum);
+% end
 
-    z_spectrum = do.robust_z(analysis_spectrum, 2); % amount of noise depends on the frequency, calculate robust z per each frequency
-    weights = abs(z_spectrum) < 5;
+original_spectrum = analysis_spectrum;
+
+% Outlier rejection if requested
+if pv.reject_outlier
+
+    % robust z assumes normal dist => log spectrum must be used
+    z_spectrum = do.robust_z(log10(analysis_spectrum), 2); % amount of noise depends on the frequency, calculate robust z per each frequency
+    weights = abs(z_spectrum) < pv.outlier_z_threshold;
+
 else
+
     weights = 1;
 
 end
+
+% Exclude those frequency ranges that were assigned to contain apriori
+% peaks, if any, from aperiodic component fitting
 isFreqExcldFromAp = false(size(analysis_freqs));
 for ii = 1:size(apriori_peak_range,1)
     isFreqExcldFromAp = isFreqExcldFromAp | do.ifwithin(analysis_freqs, apriori_peak_range(ii,:));
 end
 
-obj.iter = 0; % Step 3 is the iterative fine-tuning of Step 1 and 2
+% Initiate parameters for the first iteration
+obj.iter = 0;
 n_peaks = obj.max_n_peaks;
 includeKnee = false;
 
 if pv.plot
 
     figure;
-    plot(analysis_freqs, original_spectrum, LineAlpha=.5);
+    plot(analysis_freqs, original_spectrum);
     hold on;
     drawnow();
 
 end
 
 isConverged = false;
+isInitialAPRefit = false;
 while obj.iter <= obj.max_refit_n_iter && ~isConverged
 
     %% -- Step 1: Aperiodic Fits ---
+    obj.initiate(includeKnee=includeKnee, n_peaks=n_peaks)
+    p_mdl = obj.periodic_model;
+    ap_mdl = obj.aperiodic_model;
+    p_fitter = obj.periodic_minimizer;
+    ap_fitter = obj.aperiodic_minimizer;
 
+    % -- Already initiated at construction ---
     % initiate the periodic and aperiodic model
-    p_mdl = SumOfGaussians(n_peaks = n_peaks, ...
-        min_peak_width = obj.min_peak_width,...
-        min_peak_distance = obj.min_peak_distance,...
-        min_peak_frequency = obj.min_peak_frequency,...
-        max_peak_frequency = obj.max_peak_frequency,...
-        verbose = false);
-    ap_mdl = ExponentialPowerLaw(includeKnee = includeKnee, inLogScale=true, verbose=false);
+    % p_mdl = SumOfGaussians(n_peaks = n_peaks, ...
+    %     min_peak_width = obj.min_peak_width,...
+    %     min_peak_distance = obj.min_peak_distance,...
+    %     min_peak_frequency = obj.min_peak_frequency,...
+    %     max_peak_frequency = obj.max_peak_frequency,...
+    %     verbose = false);
+    % ap_mdl = ExponentialPowerLaw(includeKnee = includeKnee, inLogScale=true, verbose=false);
     
     % Provide data to models
     p_mdl.X = analysis_freqs;
-    p_mdl.Y = analysis_spectrum;   
+    p_mdl.Y = analysis_spectrum;
     p_mdl.W = weights;
 
     ap_mdl.X = analysis_freqs(~isFreqExcldFromAp);
-    ap_mdl.Y = analysis_spectrum(~isFreqExcldFromAp,:);
     ap_mdl.W = weights;
+    if ~isInitialAPRefit
+        
+        ap_mdl.Y = analysis_spectrum(~isFreqExcldFromAp,:);
+        
+    else
+        ap_mdl.Y = initial_ap_res;
+    end
     
-    p_fitter = NLLFitter(p_mdl);
-    ap_fitter = NLLFitter(ap_mdl);
+    % p_fitter = NLLFitter(p_mdl);
+    % ap_fitter = NLLFitter(ap_mdl);
+
     % --- Step 1: Aperiodic Fit (Robust) ---
     if obj.iter <= 1
         % In Steps 0 & 1 re-estimate aperiodic params from
         % data which is 'original_spectrum' in Step #0 and
         % 'original_spectrum/periodic_fit' in Step #1
-        if obj.iter == 0
+        if obj.iter == 0 & ~isInitialAPRefit
             
-            p_p0 = p_mdl.estimate(analysis_freqs, analysis_spectrum);
-            n_peaks = (numel(p_p0)-1)/3;
-            p_p0(end) = 0; % no baseline to correct for
+            if obj.log_scale
+                p_est_args = {'scale', 'log'};
+            else
+                p_est_args = {};
+            end
+            p_p0 = p_mdl.estimate(analysis_freqs, analysis_spectrum, p_est_args{:},scale='log');
+            n_peaks = (numel(p_p0)-p_mdl.includeBaseline)/3;
+            if p_mdl.includeBaseline
+                p_p0(end) = 0; % no baseline to correct for
+            end
             if n_peaks ~= p_mdl.n_peaks
                 % triggers re-solving the model
                 p_mdl.n_peaks = n_peaks;
             end
             p_init_fit = p_mdl.predict(p_p0, analysis_freqs);
+
 
             % update results
             obj.append_to_results( ...
@@ -117,8 +154,10 @@ while obj.iter <= obj.max_refit_n_iter && ~isConverged
                 seed = p_p0, ...
                 nextEntry=true);
             
-            % update y_data as the subtraction
-            ap_mdl.Y = analysis_spectrum(~isFreqExcldFromAp,:) - p_init_fit(~isFreqExcldFromAp);
+            % update y_data for ap as the difference or ratio
+            % ap_mdl.Y = obj.isolate_component_(analysis_spectrum(~isFreqExcldFromAp,:), p_init_fit(~isFreqExcldFromAp));
+            initial_ap_res = analysis_spectrum(~isFreqExcldFromAp,:)./10.^p_init_fit(~isFreqExcldFromAp);
+            ap_mdl.Y = initial_ap_res;
             ap_mdl.W = weights;
 
         end
@@ -147,7 +186,7 @@ while obj.iter <= obj.max_refit_n_iter && ~isConverged
         'Display', 'off',...
         'Algorithm', 'interior-point', ... % This algorithm can use the Hessian
         'SpecifyObjectiveGradient', true, ...
-        'HessianFcn', @(p, ~) ap_fitter.compute_hessian(p), ...
+        'HessianFcn', @(p, ~) ap_fitter.calculate_hessian(p), ...
         'MaxFunctionEvaluations', obj.max_func_eval, ...
         'MaxIterations', obj.max_fit_iter);
 
@@ -206,9 +245,11 @@ while obj.iter <= obj.max_refit_n_iter && ~isConverged
 
         includeKnee = true;
         
-        simple_ap_fitter = ap_fitter;
+        simple_ap_fitter = ap_fitter.copy();
         simple_ap_params = ap_params;
         simple_ap_aic = curr_ap_aic;
+
+        isInitialAPRefit = true;
 
         % simple_ap_iter = ap_iter;
         % simple_ap_isConverged = ap_isConverged;
@@ -219,14 +260,16 @@ while obj.iter <= obj.max_refit_n_iter && ~isConverged
     elseif obj.iter <= 1 && prevModelSurvived
 
             ap_fitter = simple_ap_fitter;
-            ap_mdl = simple_ap_fitter.inner_model;
+            ap_mdl = simple_ap_fitter.Model;
             ap_params = simple_ap_params;
+            isInitialAPRefit = false;
 
     else
         
         modelSurvived = ~prevModelSurvived;
         if isempty(modelSurvived), modelSurvived = NaN; end
         obj.append_to_results(modelSurvived=modelSurvived);
+        isInitialAPRefit = false;
     
     end
     
@@ -234,7 +277,7 @@ while obj.iter <= obj.max_refit_n_iter && ~isConverged
 
     % Fit aperiodic function, and flatten the original data
     ap_fit = ap_mdl.predict([], analysis_freqs);
-    p_mdl.Y = original_spectrum - ap_fit;
+    p_mdl.Y = obj.isolate_component_(original_spectrum, ap_fit);
     p_mdl.W = weights;
 
     if pv.plot
@@ -247,13 +290,13 @@ while obj.iter <= obj.max_refit_n_iter && ~isConverged
         
     % Get initial estimates
     if obj.iter <= 1
-        p_fitter.inner_model.n_peaks = obj.max_n_peaks;
-        p_p0 = p_fitter.estimate();
+        p_fitter.Model.n_peaks = obj.max_n_peaks;
+        p_p0 = p_fitter.estimate(scale='log');
         
     else
         p_p0 = p_params; 
     end
-    n_peaks = (numel(p_p0)-2)/3;
+    n_peaks = (numel(p_p0)-(1+obj.includeBaseline))/3;
 
     % Estimate bounds from data  
 
@@ -272,7 +315,7 @@ while obj.iter <= obj.max_refit_n_iter && ~isConverged
         'Display', 'off',...
         'Algorithm', 'interior-point', ... % This algorithm can use the Hessian
         'SpecifyObjectiveGradient', true, ...
-        'HessianFcn', @(p, ~) p_fitter.compute_hessian(p), ...
+        'HessianFcn', @(p, ~) p_fitter.calculate_hessian(p), ...
         'MaxFunctionEvaluations', obj.max_func_eval, ...
         'MaxIterations', obj.max_fit_iter);
     % isempty(iTestPeak) = true during refitting
@@ -281,13 +324,17 @@ while obj.iter <= obj.max_refit_n_iter && ~isConverged
         n_peaksN = numel(iKeepPeak) + numel(iTestPeak);
         p_mdl.n_peaks = n_peaksN;
 
-        kept_peaks = arrayfun(@(i) curr_p0(i:n_peaks:end-2), iKeepPeak, UniformOutput=false);
+        kept_peaks = arrayfun(@(i) curr_p0(i:n_peaks:end-(1+obj.includeBaseline)), iKeepPeak, UniformOutput=false);
         
         
         kept_peaks = vertcat(kept_peaks{:});
 
-        pN = [kept_peaks; curr_p0(iTestPeak:n_peaks:end-2)];
-        bN = curr_p0(end-1);
+        pN = [kept_peaks; curr_p0(iTestPeak:n_peaks:end-(1+obj.includeBaseline))];
+        if obj.includeBaseline
+            bN = curr_p0(end-1);
+        else
+            bN = [];
+        end
         sigmaN = curr_p0(end);
         pN = [pN(:); bN; sigmaN]';
 
@@ -330,9 +377,9 @@ while obj.iter <= obj.max_refit_n_iter && ~isConverged
 
             % update inital estimates
             for iKept = 1:n_peaksN
-                curr_p0(iKeepPeak(iKept):n_peaks:end-2) = p_paramsN(iKept:n_peaksN:end-2);
+                curr_p0(iKeepPeak(iKept):n_peaks:end-(1+obj.includeBaseline)) = p_paramsN(iKept:n_peaksN:end-(1+obj.includeBaseline));
             end
-            curr_p0(end-1:end) = p_paramsN(end-1:end);
+            curr_p0((end-obj.includeBaseline):end) = p_paramsN((end-obj.includeBaseline):end);
             
         end
 
@@ -377,7 +424,11 @@ while obj.iter <= obj.max_refit_n_iter && ~isConverged
         % y to fit the aperiodic component in the next iteration, add the
         % baseline estimate for a correct estimate of intercept
         p_fit = p_mdl.predict(p_params(1:end-1));
-        analysis_spectrum = original_spectrum - p_fit + p_params(end-1);
+        if obj.includeBaseline
+            % validate if this is the correct parameter
+            p_fit = p_fit + p_paramsN(end-2);
+        end
+        analysis_spectrum = obj.isolate_component_(original_spectrum, p_fit);
 
         includeKnee = false;
 
@@ -385,7 +436,7 @@ while obj.iter <= obj.max_refit_n_iter && ~isConverged
 
     if pv.plot
 
-        plot(analysis_freqs, ap_fit+p_fit, line_styles((mod(obj.iter,2)==1)+1), LineWidth = 3);
+        plot(analysis_freqs, ap_fit .* p_fit, pv.line_styles((mod(obj.iter,2)==1)+1), LineWidth = 3);
         hold on;
         drawnow();
 
@@ -393,13 +444,16 @@ while obj.iter <= obj.max_refit_n_iter && ~isConverged
 
     % continue to next iteration
     obj.next();
-    if obj.iter > 1
-        break;
-    end
+    % if obj.iter > 1
+    %     break;
+    % end
     
 end
 
 results = obj.results;
+catch e
+    aa
+end
 end % fit()
 
 
